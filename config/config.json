@@ -1,0 +1,13 @@
+{
+  "coco": {
+    "description" : "This object contains the config  used for the raw dataset. The path can be concrete or null.",
+    "path": "F:/coco",
+    "dataset": "coco-2017"
+  },
+  "mongodb": {
+    "description": "This object contains the config used for the MongoDB Server",
+    "url": "mongodb://localhost:27017/",
+    "db": "seminar",
+    "collection": "traffic_lights"
+  }
+}
