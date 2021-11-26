@@ -39,6 +39,9 @@ class MongoDBClient:
 
         # Update the id. MongoDB stores ids in _id as opposed to coco which stores it in id.
         document_cpy = copy.deepcopy(document)
-        document_cpy['_id'] = document_cpy.pop('id')
+        try:
+            document_cpy['_id'] = document_cpy.pop('id')
+        except KeyError:
+            pass
 
         collection.insert_one(document_cpy)

@@ -31,6 +31,7 @@ class Config:
             self.db_url = cfg['mongodb']['url']
             self.db_name = cfg['mongodb']['db']
             self.db_collection = cfg['mongodb']['collection']
+
         except FileNotFoundError:
             Printer.error(f"No file {path} found.")
             sys.exit(-1)

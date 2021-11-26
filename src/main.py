@@ -3,6 +3,7 @@ Automatically loads the COCO dataset into a mongoDB instance.
 """
 
 import getopt
+import json
 import os
 import sys
 import pymongo.errors
@@ -26,9 +27,8 @@ class Loader:
 
     def __init__(self):
         self.data_dl = DatasetDownloader()
-        self.data_files = self._discover_files()
+        self.data_paths = self._discover_files()
         self.db_client = MongoDBClient()
-        self.coco_cats = self._get_coco_cats()
 
     def _discover_files(self):
         """ Traverses the directory of the downloaded dataset and adds all .json paths to a list. """
@@ -41,17 +41,7 @@ class Loader:
 
         return paths
 
-    def _get_coco_cats(self):
-        """ Returns a list of coco categories as strings. """
-
-        # find the instances_train file because this contains certainly all categories using list comprehension.
-        instance_file = [file for file in self.data_files if 'instances_train' in file][0]
-
-        coco = COCO(instance_file)
-        cats = coco.loadCats(coco.getCatIds())
-        return [cat['name'] for cat in cats]
-
-    def fill_db(self, cat: str = None, collection: str = None):
+    def fill_db(self, cat: str = None):
         """
         Extracts the images from the coco data files and stores them individually into the database duplicate free.
 
@@ -61,59 +51,66 @@ class Loader:
         :type collection: str
         """
 
-        cat_names = []
-        global_counter = 0
 
-        # Check if a coco coco category is given. If it is, just use this category.
-        if cat is not None:
-            if cat in self.coco_cats:
-                cat_names.append(cat)
-            else:
-                Printer.error("No such COCO category.")
-                sys.exit(-1)
+        # Basic population:
+        if cat is None:
+            for path in self.data_paths:
 
-        # Else use all categories
-        else:
-            cat_names = self.coco_cats
+                Printer.info(f"loading file {path}")
+                json_file = json.load(open(path))
 
-        # wrap in a list in order to process each cat individually.
-        cat_wrapper = _wrap(cat_names)
-
-        for file in self.data_files:
-            counter = 0
-            coco = COCO(file)
-
-            for cat in cat_wrapper:
-
-                # Get the image data for each file -  continue with the next file if it has none.
+                # Basic Population of DB.
                 try:
-                    cat_ids = coco.getCatIds(catNms=cat)
-                    img_ids = coco.getImgIds(catIds=cat_ids)
-                    images = coco.loadImgs(ids=img_ids)
+                    image_list = self._bulk_insert(json_file['images'], 'all_images')
+                    cat_list = self._bulk_insert(json_file['categories'], 'categories')
+                    annotations_list = self._bulk_insert(json_file['annotations'], 'annotations')
                 except KeyError:
                     continue
+        else:
+            collection_name = cat.replace(" ", "_")
+            counter = 0
 
-                # Insert the images into the db
-                for img in images:
-                    try:
-                        self.db_client.insert_document(document=img, collection=collection)
-                        global_counter += 1
-                        counter += 1
-                    except pymongo.errors.DuplicateKeyError:
-                        continue
-            Printer.info(f"Added {counter} images from {file}.")
-        Printer.success(f"Successfully added {global_counter} images to the database.")
+            # Get the category as JSON object and find the id.
+            collection = self.db_client.db['categories']
+            cat_object = collection.find_one({"name": cat})
+            cat_id = cat_object['_id']
 
+            # Get a cursor to annotations with the given category.
+            collection = self.db_client.db['annotations']
+            cursor = collection.find({"category_id": cat_id})
 
-def _wrap(names: list):
-    """ Wraps the list of names in another list and returns it. """
-    wrapper = []
+            # Get the collection of images.
+            collection = self.db_client.db['all_images']
 
-    for name in names:
-        wrapper.append([name])
+            for annotation in cursor:
+                # Get the image id.
+                img_id = annotation['image_id']
 
-    return wrapper
+                # Find the concrete image.
+                image = collection.find_one({"_id": img_id})
 
+                # insert it into a new collection
+                try:
+                    self.db_client.insert_document(image, collection_name)
+                    counter += 1
+                except pymongo.errors.DuplicateKeyError:
+                    continue
+
+            Printer.success(f"Inserted {counter} images into {collection_name}.")
+
+    def _bulk_insert(self, data: list, collection):
+        """ Bulk inserts documents while skipping duplicates. """
+        counter = 0
+
+        for item in data:
+            try:
+                self.db_client.insert_document(item, collection)
+                counter += 1
+            except pymongo.errors.DuplicateKeyError:
+                continue
+
+        print(f"Inserted {counter} JSON objects into {collection}.")
+        return data
 
 def main(argv):
     """
@@ -124,7 +121,7 @@ def main(argv):
     """
 
     try:
-        opts, args = getopt.getopt(argv, "hn:c:", ["help", "cat_name", "collection"])
+        opts, args = getopt.getopt(argv, "hv:c:", ["help", "verbose", "category"])
     except getopt.GetoptError:
         Printer.error("Unknown command line arguments")
         sys.exit(-1)
@@ -137,24 +134,72 @@ def main(argv):
         if opt in ("-h", "--help"):
             help_me()
             sys.exit(0)
-        elif opt in ("-n", "--cat_name"):
-            cat_name = arg
-        elif opt in ("-c", "--collection"):
-            collection = arg
 
-    Printer.info(f"Starting the procedure.")
-    loader = Loader()
-    loader.fill_db(cat_name, collection)
-    Printer.info(f"Finished the procedure.")
+        elif opt in ("-v", "--verbose"):
+            cp = Comparator()
+            cp.find(arg)
 
+        elif opt in ("-n", "--category"):
+            ldr = Loader()
+            ldr.fill_db(arg)
+
+        else:
+            ldr = Loader()
+            ldr.fill_db()
 
 def help_me():
     Printer.info(
-        "Before you start, make sure you have everything set in ./config/config.json.\n"
-        "You can set a specific category name using the '-n' or '--cat_name' operator.\n"
-        "You can set a specific collection name using the '-c' or '--collection' operator."
+        "Before you start, make sure you have everything set in ./config/config.json."
+        "Filling the database will be done by two ways:\n"
+        "- Generating ALL data (required for the first time!) using no command line arguments.\n"
+        "- Generating specific category data using the -c or --category optional argument.\n\n"
+        "If you have your DB already setup you can use the -v or --verbose to get the biggest and the smallest image."
     )
 
 
+class Comparator:
+    """
+    Find the biggest and smallest picture of the dataset in MongoDB.
+    """
+
+    def __init__(self):
+        self.db_client = MongoDBClient()
+        self.MAX = 0
+        self.max_doc = None
+        self.MIN = (2 ** 31) - 1  # max int value
+        self.min_doc = None
+
+    def find(self, collection):
+        """
+        Findds the biggest and smalles picture of the dataset in MongoDB.
+
+        :param collection: The collection to search.
+        """
+
+        collection = self.db_client.db[collection]
+        cursor = collection.find()
+
+        for image in cursor:
+
+            height = image.get("height")
+            width = image.get("width")
+
+            # Make sure both height and width exist and are integers.
+            assert isinstance(height, int) and isinstance(width, int)
+
+            dimension = height * width
+
+            if dimension < self.MIN:
+                self.MIN = dimension
+                self.min_doc = image
+            elif dimension > self.MAX:
+                self.MAX = dimension
+                self.max_doc = image
+
+        Printer.info(f"biggest image is {self.max_doc} with {self.MAX} pixels.")
+        Printer.info(f"smallest image is {self.min_doc} with {self.MIN} pixels.")
+
+# replace with main function and argv.
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    cp = Loader()
+    cp.fill_db(cat="traffic light")
